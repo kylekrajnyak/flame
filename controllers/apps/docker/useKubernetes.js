@@ -1,49 +1,124 @@
-const App = require('../../../models/App');
-const k8s = require('@kubernetes/client-node');
-const Logger = require('../../../utils/Logger');
+const App = require("../../../models/App");
+const axios = require("axios");
+const Logger = require("../../../utils/Logger");
 const logger = new Logger();
-const loadConfig = require('../../../utils/loadConfig');
+const loadConfig = require("../../../utils/loadConfig");
 
-const useKubernetes = async (apps) => {
-  const { useOrdering: orderType, unpinStoppedApps } = await loadConfig();
+const useDocker = async (apps) => {
+  const {
+    useOrdering: orderType,
+    unpinStoppedApps,
+    dockerHost: host,
+  } = await loadConfig();
 
-  let ingresses = null;
+  let containers = null;
 
+  // Get list of containers
   try {
-    const kc = new k8s.KubeConfig();
-    kc.loadFromCluster();
-    const k8sNetworkingV1Api = kc.makeApiClient(k8s.NetworkingV1Api);
-    await k8sNetworkingV1Api.listIngressForAllNamespaces().then((res) => {
-      ingresses = res.body.items;
-    });
+    if (host.includes("localhost")) {
+      // Use default host
+      let { data } = await axios.get(
+        `http://${host}/containers/json?{"status":["running"]}`,
+        {
+          socketPath: "/var/run/docker.sock",
+        }
+      );
+
+      containers = data;
+    } else {
+      // Use custom host
+      let { data } = await axios.get(
+        `http://${host}/containers/json?{"status":["running"]}`
+      );
+
+      containers = data;
+    }
   } catch {
-    logger.log("Can't connect to the Kubernetes API", 'ERROR');
+    logger.log(`Can't connect to the Docker API on ${host}`, "ERROR");
   }
 
-  if (ingresses) {
+  if (containers) {
     apps = await App.findAll({
-      order: [[orderType, 'ASC']],
+      order: [[orderType, "ASC"]],
     });
 
-    ingresses = ingresses.filter(
-      (e) => Object.keys(e.metadata.annotations).length !== 0
-    );
+    // Filter out containers without any annotations
+    containers = containers.filter((e) => Object.keys(e.Labels).length !== 0);
 
-    const kubernetesApps = [];
+    const dockerApps = [];
 
-    for (const ingress of ingresses) {
-      const annotations = ingress.metadata.annotations;
+    for (const container of containers) {
+      let labels = container.Labels;
 
+      // Traefik labels for URL configuration
+      if (!("flame.url" in labels)) {
+        for (const label of Object.keys(labels)) {
+          if (/^traefik.*.frontend.rule/.test(label)) {
+            // Traefik 1.x
+            let value = labels[label];
+
+            if (value.indexOf("Host") !== -1) {
+              value = value.split("Host:")[1];
+              labels["flame.url"] =
+                "https://" + value.split(",").join(";https://");
+            }
+          } else if (/^traefik.*?\.rule/.test(label)) {
+            // Traefik 2.x
+            const value = labels[label];
+
+            if (value.indexOf("Host") !== -1) {
+              const regex = /\`([a-zA-Z0-9\.\-]+)\`/g;
+              const domains = [];
+
+              while ((match = regex.exec(value)) != null) {
+                domains.push("http://" + match[1]);
+              }
+
+              if (domains.length > 0) {
+                labels["flame.url"] = domains.join(";");
+              }
+            }
+          }
+        }
+      }
+
+      // add each container as flame formatted app
       if (
-        'flame.pawelmalak/name' in annotations &&
-        'flame.pawelmalak/url' in annotations &&
-        /^app/.test(annotations['flame.pawelmalak/type'])
+        "flame.name" in labels &&
+        "flame.url" in labels &&
+        /^app/.test(labels["flame.type"])
       ) {
-        kubernetesApps.push({
-          name: annotations['flame.pawelmalak/name'],
-          url: annotations['flame.pawelmalak/url'],
-          icon: annotations['flame.pawelmalak/icon'] || 'kubernetes',
-        });
+        for (let i = 0; i < labels["flame.name"].split(";").length; i++) {
+          const names = labels["flame.name"].split(";");
+          const urls = labels["flame.url"].split(";");
+          let icons = "";
+          let descriptions = "";
+          let visibility = "";
+
+          if ("flame.icon" in labels) {
+            icons = labels["flame.icon"].split(";");
+          }
+
+          if ("flame.description" in labels) {
+            descriptions = labels["flame.description"].split(";");
+          }
+
+          if ("flame.visible" in labels) {
+            visibility = labels["flame.visible"].split(";");
+          }
+
+          dockerApps.push({
+            name: names[i] || names[0],
+            url: urls[i] || urls[0],
+            icon: icons[i] || "docker",
+            // Add description and visbility
+            description: descriptions[i] || "",
+            isPublic:
+              (visibility[i] && /^true$/.test(visibility[i])
+                ? visibility[i]
+                : visibility[0]) || null,
+          });
+        }
       }
     }
 
@@ -53,13 +128,38 @@ const useKubernetes = async (apps) => {
       }
     }
 
-    for (const item of kubernetesApps) {
-      if (apps.some((app) => app.name === item.name)) {
-        const app = apps.find((a) => a.name === item.name);
-        await app.update({ ...item, isPinned: true });
+    for (const item of dockerApps) {
+      // If app already exists, update it
+      // Find by name or url
+      if (apps.some((app) => app.name === item.name || app.url === item.url)) {
+        const app = apps.find(
+          (a) => a.name === item.name || app.url === item.url
+        );
+
+        if (
+          item.icon === "custom" ||
+          (item.icon === "docker" && app.icon != "docker")
+        ) {
+          // update without overriding icon
+          await app.update({
+            name: item.name,
+            url: item.url,
+            // Add description and visbility
+            description: item.description,
+            isPublic: item.isPublic,
+            isPinned: true,
+          });
+        } else {
+          await app.update({
+            ...item,
+            isPinned: true,
+          });
+        }
       } else {
+        // else create new app
         await App.create({
           ...item,
+          icon: item.icon === "custom" ? "docker" : item.icon,
           isPinned: true,
         });
       }
@@ -67,4 +167,4 @@ const useKubernetes = async (apps) => {
   }
 };
 
-module.exports = useKubernetes;
+module.exports = useDocker;
